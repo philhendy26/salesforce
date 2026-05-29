@@ -1,0 +1,180 @@
+SF_USERNAME=your.email@company.com
+SF_PASSWORD=YourPassword123
+SF_SECURITY_TOKEN=YourSecurityTokenHere1234567890   # Get from Salesforce Setup > My Personal Information > Reset Security Token
+SF_DOMAIN=login          # Use 'test' for sandbox
+
+# =============================================
+# Salesforce Pipeline Analysis Dashboard
+# Real Connection using simple-salesforce
+# =============================================
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from simple_salesforce import Salesforce
+import os
+from dotenv import load_dotenv
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================
+# 1. Load Credentials & Connect to Salesforce
+# ============================
+
+load_dotenv()
+
+try:
+    sf = Salesforce(
+        username=os.getenv('SF_USERNAME'),
+        password=os.getenv('SF_PASSWORD'),
+        security_token=os.getenv('SF_SECURITY_TOKEN'),
+        domain=os.getenv('SF_DOMAIN', 'login')   # 'login' for production, 'test' for sandbox
+    )
+    print("✅ Successfully connected to Salesforce!")
+except Exception as e:
+    print(f"❌ Connection failed: {e}")
+    print("Check your .env file and Security Token.")
+    exit()
+
+# ============================
+# 2. SOQL Query - Fetch Opportunity Data
+# ============================
+
+soql_query = """
+SELECT 
+    Id,
+    Name,
+    Account.Name,
+    StageName,
+    Amount,
+    CloseDate,
+    Owner.Name,
+    Region__c,
+    LeadSource,
+    Days_In_Stage__c,
+    Probability
+FROM Opportunity 
+WHERE CloseDate >= THIS_QUARTER 
+  AND IsClosed = false OR (IsClosed = true AND CloseDate = LAST_N_DAYS:90)
+ORDER BY CloseDate DESC
+LIMIT 1000
+"""
+
+print("🔄 Running SOQL query...")
+response = sf.query_all(soql_query)   # query_all handles large result sets automatically
+
+# Convert to pandas DataFrame
+records = response['records']
+df = pd.json_normalize(records)
+
+# Clean column names
+df.columns = [col.replace('attributes.', '').replace('.', '_') for col in df.columns]
+rename_map = {
+    'Id': 'Opportunity_ID',
+    'Name': 'Opportunity_Name',
+    'Account_Name': 'Account_Name',
+    'StageName': 'Stage',
+    'Owner_Name': 'Sales_Rep',
+    'Region__c': 'Region',
+    'LeadSource': 'Lead_Source',
+    'Days_In_Stage__c': 'Days_in_Stage'
+}
+df.rename(columns=rename_map, inplace=True)
+
+print(f"✅ Loaded {len(df)} opportunities from Salesforce")
+
+# ============================
+# 3. Data Transformation & Feature Engineering
+# ============================
+
+df['CloseDate'] = pd.to_datetime(df['CloseDate'])
+df['Month'] = df['CloseDate'].dt.strftime('%Y-%m')
+df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0)
+
+# Win / Loss flags
+df['Is_Won'] = df['Stage'].apply(lambda x: 1 if x == 'Closed Won' else 0)
+df['Is_Lost'] = df['Stage'].apply(lambda x: 1 if x == 'Closed Lost' else 0)
+df['Is_Open'] = df['Stage'].apply(lambda x: 1 if 'Closed' not in x else 0)
+
+# ============================
+# 4. Key Metrics Dashboard
+# ============================
+
+print("\n" + "="*60)
+print("SALES PIPELINE ANALYSIS DASHBOARD")
+print("="*60)
+print(f"Report Date     : {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+print(f"Total Opportunities : {len(df):,}")
+print(f"Total Pipeline Value: ${df['Amount'].sum():,}")
+print(f"Closed Won Value    : ${df[df['Is_Won']==1]['Amount'].sum():,}")
+print(f"Overall Win Rate    : {df['Is_Won'].mean():.1% if len(df)>0 else 0}")
+print(f"Avg Deal Size       : ${df['Amount'].mean():,.0f}")
+
+# Performance by Region
+print("\n--- Performance by Region ---")
+region_perf = df.groupby('Region').agg({
+    'Opportunity_ID': 'count',
+    'Amount': ['sum', 'mean'],
+    'Is_Won': 'mean'
+}).round(2)
+region_perf.columns = ['Opportunities', 'Total Value', 'Avg Deal', 'Win Rate']
+print(region_perf)
+
+# Top Sales Reps
+print("\n--- Top 5 Sales Reps by Value ---")
+top_reps = df.groupby('Sales_Rep')['Amount'].sum().nlargest(5)
+print(top_reps)
+
+# ============================
+# 5. Visualizations
+# ============================
+
+fig = make_subplots(
+    rows=2, cols=2,
+    subplot_titles=(
+        "Pipeline Value by Stage",
+        "Win Rate by Region",
+        "Top Sales Reps (Value)",
+        "Days in Stage Distribution"
+    ),
+    specs=[[{"type": "bar"}, {"type": "bar"}],
+           [{"type": "bar"}, {"type": "histogram"}]]
+)
+
+# Pipeline by Stage
+stage_data = df.groupby('Stage')['Amount'].sum().reset_index()
+fig.add_trace(go.Bar(x=stage_data['Stage'], y=stage_data['Amount']), row=1, col=1)
+
+# Win Rate by Region
+win_rate = df.groupby('Region')['Is_Won'].mean().reset_index()
+fig.add_trace(go.Bar(x=win_rate['Region'], y=win_rate['Is_Won']), row=1, col=2)
+
+# Top Reps
+fig.add_trace(go.Bar(x=top_reps.index, y=top_reps.values), row=2, col=1)
+
+# Days in Stage
+fig.add_trace(go.Histogram(x=df['Days_in_Stage'].dropna()), row=2, col=2)
+
+fig.update_layout(
+    height=900,
+    title_text="Salesforce Sales Pipeline Analysis - " + datetime.now().strftime("%B %Y"),
+    showlegend=False
+)
+fig.show()
+
+# ============================
+# 6. Export Reports
+# ============================
+
+summary = df.groupby(['Region', 'Stage', 'Sales_Rep']).agg({
+    'Opportunity_ID': 'count',
+    'Amount': 'sum',
+    'Is_Won': 'sum'
+}).rename(columns={'Opportunity_ID': 'Count'})
+
+summary.to_excel(f'sales_pipeline_summary_{datetime.now().strftime("%Y%m%d")}.xlsx')
+
+print(f"\n✅ Analysis complete! Report exported to: sales_pipeline_summary_{datetime.now().strftime('%Y%m%d')}.xlsx")
